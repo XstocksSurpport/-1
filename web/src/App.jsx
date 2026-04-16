@@ -62,6 +62,22 @@ export default function App() {
   useEffect(() => {
     const eth = getEthereum();
     if (!eth) return;
+
+    const syncAccounts = async () => {
+      try {
+        const accs = await eth.request({ method: "eth_accounts" });
+        if (accs?.length) {
+          try {
+            setAccount(ethers.getAddress(accs[0]));
+          } catch {
+            setAccount(accs[0]);
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+
     const onChain = () => {
       refreshChain();
     };
@@ -70,12 +86,18 @@ export default function App() {
         setAccount(null);
         setScan(null);
       } else {
-        setAccount(accs[0]);
+        try {
+          setAccount(ethers.getAddress(accs[0]));
+        } catch {
+          setAccount(accs[0]);
+        }
       }
     };
+
+    void syncAccounts();
+    void refreshChain();
     eth.on("chainChanged", onChain);
     eth.on("accountsChanged", onAccounts);
-    refreshChain();
     return () => {
       eth.removeListener("chainChanged", onChain);
       eth.removeListener("accountsChanged", onAccounts);
@@ -96,17 +118,31 @@ export default function App() {
   };
 
   const onScan = async () => {
-    if (!provider || !account) return;
+    const eth = getEthereum();
+    if (!eth) {
+      log("未检测到浏览器钱包（如 MetaMask）。请安装扩展或使用内置钱包的浏览器。", "err");
+      return;
+    }
+    const prov = provider ?? new BrowserProvider(eth);
+    if (!account) {
+      log("请先点击上方「连接钱包」并授权；若已连接，请刷新页面后再点扫描。", "err");
+      return;
+    }
+
     clear();
     setBusy(true);
     setScan(null);
+    log("开始扫描…");
     try {
-      const eth = getEthereum();
       if (eth) {
         const hex = await eth.request({ method: "eth_chainId" });
-        assertBsc(BigInt(hex));
+        const cid = BigInt(hex);
+        if (cid !== 56n) {
+          log(`当前网络 chainId=${cid}，需要 BNB Chain（56）。请在钱包里切换到 BSC 主网后再扫。`, "err");
+          return;
+        }
       } else {
-        const net = await provider.getNetwork();
+        const net = await prov.getNetwork();
         assertBsc(net.chainId);
       }
 
@@ -120,7 +156,7 @@ export default function App() {
       const lpIn = lpPairAddress.trim();
       if (lpIn) {
         log("按 LP Pair 合约地址解析 token0 / token1 …");
-        const r = await resolvePairByLpAddress(provider, lpIn);
+        const r = await resolvePairByLpAddress(prov, lpIn);
         pairAddr = r.pairAddr;
         pair = r.pair;
         t0 = r.t0;
@@ -135,7 +171,7 @@ export default function App() {
         const tokenB = ethers.getAddress(wbnb.trim());
         const fac = ethers.getAddress(factory.trim());
         log("正在通过 Factory + 双币查询交易对…");
-        const r = await resolvePair(provider, tokenA, tokenB, fac);
+        const r = await resolvePair(prov, tokenA, tokenB, fac);
         pairAddr = r.pairAddr;
         pair = r.pair;
         t0 = r.t0;
@@ -154,7 +190,7 @@ export default function App() {
         log("已勾选「跳过农场扫描」，未查询 MasterChef。", "info");
       } else {
         log("正在扫描 MasterChef V1/V2（已用 Multicall 合并请求，避免卡死）…");
-        positions = await scanFarmPositions(provider, pairAddr, account, {
+        positions = await scanFarmPositions(prov, pairAddr, account, {
           onProgress: (m) => log(m),
         });
       }
@@ -353,10 +389,14 @@ export default function App() {
           </label>
         </div>
         <div className="actions">
-          <button type="button" className="primary" onClick={onScan} disabled={busy || !account || !chainOk}>
-            扫描链上状态
+          <button type="button" className="primary" onClick={onScan} disabled={busy}>
+            {busy ? "扫描中…" : "扫描链上状态"}
           </button>
         </div>
+        <p className="sub" style={{ marginTop: "0.5rem", marginBottom: 0 }}>
+          若点了没动静：看下方<strong>日志</strong>里的红字提示。须连接钱包并处于{" "}
+          <strong>BNB Chain（56）</strong>；按钮在扫描中会显示「扫描中…」。
+        </p>
       </div>
 
       {scan && (
