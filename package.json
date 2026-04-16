@@ -1,0 +1,16 @@
+{
+  "name": "pancake-lp-recover",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "recover": "node recover-lp.mjs",
+    "web:dev": "npm run dev --prefix web",
+    "web:build": "npm run build --prefix web",
+    "web:preview": "npm run preview --prefix web"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  }
+}

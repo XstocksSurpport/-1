@@ -1,0 +1,328 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { BrowserProvider, ethers } from "ethers";
+import {
+  DEFAULT_RECIPIENT,
+  DEFAULT_TOKEN,
+  DEFAULT_WBNB,
+  PCS_V2_FACTORY,
+  assertBsc,
+  getLpBalance,
+  removeLiquidityToRecipient,
+  resolvePair,
+  scanFarmPositions,
+  transferLp,
+  unstakeAll,
+} from "./lib/recovery.js";
+import { connectWallet, ensureBscChain, getEthereum } from "./lib/wallet.js";
+import "./App.css";
+
+function useLog() {
+  const [lines, setLines] = useState([]);
+  const log = useCallback((msg, type = "info") => {
+    const t = new Date().toISOString().slice(11, 19);
+    setLines((prev) => [...prev, { t, msg, type }]);
+  }, []);
+  const clear = useCallback(() => setLines([]), []);
+  return { lines, log, clear };
+}
+
+export default function App() {
+  const { lines, log, clear } = useLog();
+  const [account, setAccount] = useState(null);
+  const [chainOk, setChainOk] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const [token, setToken] = useState(DEFAULT_TOKEN);
+  const [wbnb, setWbnb] = useState(DEFAULT_WBNB);
+  const [recipient, setRecipient] = useState(DEFAULT_RECIPIENT);
+  const [factory, setFactory] = useState(PCS_V2_FACTORY);
+
+  const [scan, setScan] = useState(null);
+
+  const provider = useMemo(() => {
+    const eth = getEthereum();
+    if (!eth) return null;
+    return new BrowserProvider(eth);
+  }, [account]);
+
+  const refreshChain = useCallback(async () => {
+    const eth = getEthereum();
+    if (!eth) {
+      setChainOk(false);
+      return;
+    }
+    const cid = BigInt(await eth.request({ method: "eth_chainId" }));
+    setChainOk(cid === 56n);
+  }, []);
+
+  useEffect(() => {
+    const eth = getEthereum();
+    if (!eth) return;
+    const onChain = () => {
+      refreshChain();
+    };
+    const onAccounts = (accs) => {
+      if (!accs?.length) {
+        setAccount(null);
+        setScan(null);
+      } else {
+        setAccount(accs[0]);
+      }
+    };
+    eth.on("chainChanged", onChain);
+    eth.on("accountsChanged", onAccounts);
+    refreshChain();
+    return () => {
+      eth.removeListener("chainChanged", onChain);
+      eth.removeListener("accountsChanged", onAccounts);
+    };
+  }, [refreshChain]);
+
+  const onConnect = async () => {
+    clear();
+    try {
+      const addr = await connectWallet();
+      setAccount(addr);
+      await ensureBscChain();
+      await refreshChain();
+      log("已连接钱包。");
+    } catch (e) {
+      log(e.message || String(e), "err");
+    }
+  };
+
+  const onScan = async () => {
+    if (!provider || !account) return;
+    clear();
+    setBusy(true);
+    setScan(null);
+    try {
+      const net = await provider.getNetwork();
+      assertBsc(net.chainId);
+
+      const tokenA = ethers.getAddress(token.trim());
+      const tokenB = ethers.getAddress(wbnb.trim());
+      const fac = ethers.getAddress(factory.trim());
+
+      const { pairAddr, pair, t0, t1 } = await resolvePair(
+        provider,
+        tokenA,
+        tokenB,
+        fac,
+      );
+      const positions = await scanFarmPositions(provider, pairAddr, account);
+      const lpBal = await getLpBalance(pair, account);
+
+      setScan({
+        pairAddr,
+        t0,
+        t1,
+        tokenResolved: tokenA,
+        wbnbResolved: tokenB,
+        positions: [...positions.v2, ...positions.v1],
+        lpBal,
+      });
+
+      log(`交易对: ${pairAddr}`);
+      log(`钱包 LP 余额: ${lpBal.toString()}`);
+      log(
+        `农场质押: ${positions.v2.length + positions.v1.length} 处`,
+        positions.v2.length + positions.v1.length ? "ok" : "info",
+      );
+      positions.v2.forEach((p) =>
+        log(`  MC V2 pid=${p.pid} amount=${p.amount.toString()}`),
+      );
+      positions.v1.forEach((p) =>
+        log(`  MC V1 pid=${p.pid} amount=${p.amount.toString()}`),
+      );
+    } catch (e) {
+      log(e.shortMessage || e.message || String(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runUnstake = async () => {
+    if (!provider || !account || !scan?.positions?.length) return;
+    setBusy(true);
+    try {
+      const signer = await provider.getSigner();
+      await unstakeAll(signer, scan.positions, (m) => log(m));
+      log("解押完成。请再次「扫描」确认 LP 已到钱包。", "ok");
+    } catch (e) {
+      log(e.shortMessage || e.message || String(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runRemove = async () => {
+    if (!provider || !account || !scan) return;
+    setBusy(true);
+    try {
+      const net = await provider.getNetwork();
+      assertBsc(net.chainId);
+      const signer = await provider.getSigner();
+      const rec = ethers.getAddress(recipient.trim());
+      const lpAmount = await getLpBalance(
+        new ethers.Contract(scan.pairAddr, ["function balanceOf(address) view returns (uint256)"], provider),
+        account,
+      );
+      if (lpAmount === 0n) {
+        log("当前无 LP 可撤。", "err");
+        return;
+      }
+      await removeLiquidityToRecipient(
+        signer,
+        provider,
+        {
+          pairAddr: scan.pairAddr,
+          t0: scan.t0,
+          t1: scan.t1,
+          token: scan.tokenResolved,
+          wbnb: scan.wbnbResolved,
+          recipient: rec,
+          lpAmount,
+          userAddress: account,
+        },
+        (m) => log(m),
+      );
+      log("已完成撤池与转出。", "ok");
+    } catch (e) {
+      log(e.shortMessage || e.message || String(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runTransferLp = async () => {
+    if (!provider || !account || !scan) return;
+    setBusy(true);
+    try {
+      const net = await provider.getNetwork();
+      assertBsc(net.chainId);
+      const signer = await provider.getSigner();
+      const rec = ethers.getAddress(recipient.trim());
+      const pairC = new ethers.Contract(
+        scan.pairAddr,
+        ["function balanceOf(address) view returns (uint256)", "function transfer(address,uint256) returns (bool)"],
+        provider,
+      );
+      const lpAmount = await pairC.balanceOf(account);
+      if (lpAmount === 0n) {
+        log("无 LP 可转。", "err");
+        return;
+      }
+      await transferLp(signer, scan.pairAddr, rec, lpAmount, (m) => log(m));
+      log("LP 已转到接收地址。", "ok");
+    } catch (e) {
+      log(e.shortMessage || e.message || String(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <h1>PancakeSwap V2 LP 找回</h1>
+      <p className="sub">
+        在浏览器内用钱包签名；私钥不会离开本机。仅支持 BNB Chain 上官方 Factory 的 V2
+        币对与 MasterChef V1/V2 农场。
+      </p>
+
+      <div className="panel">
+        <div className="row">
+          <button type="button" className="primary" onClick={onConnect} disabled={busy}>
+            连接钱包
+          </button>
+          {account && (
+            <span className="status-pill ok">
+              {account.slice(0, 6)}…{account.slice(-4)}
+            </span>
+          )}
+          {account && (
+            <span className={chainOk ? "status-pill ok" : "status-pill warn"}>
+              {chainOk ? "BNB Chain" : "请切换到 BNB Chain"}
+            </span>
+          )}
+        </div>
+        {!getEthereum() && (
+          <p className="sub" style={{ marginBottom: 0 }}>
+            未检测到 <code>window.ethereum</code>，请用支持钱包的浏览器打开本页。
+          </p>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="row">
+          <label className="field">
+            <span>TOKEN（屎壳郎）</span>
+            <input value={token} onChange={(e) => setToken(e.target.value)} />
+          </label>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span>WBNB</span>
+            <input value={wbnb} onChange={(e) => setWbnb(e.target.value)} />
+          </label>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span>接收地址</span>
+            <input value={recipient} onChange={(e) => setRecipient(e.target.value)} />
+          </label>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span>Factory（非 Pancake 时改）</span>
+            <input value={factory} onChange={(e) => setFactory(e.target.value)} />
+          </label>
+        </div>
+        <div className="actions">
+          <button type="button" className="primary" onClick={onScan} disabled={busy || !account || !chainOk}>
+            扫描链上状态
+          </button>
+        </div>
+      </div>
+
+      {scan && (
+        <div className="panel">
+          <strong>扫描结果</strong>
+          <p className="sub" style={{ marginTop: "0.35rem" }}>
+            Pair:{" "}
+            <a href={`https://bscscan.com/address/${scan.pairAddr}`} target="_blank" rel="noreferrer">
+              {scan.pairAddr}
+            </a>
+          </p>
+          <div className="actions">
+            <button type="button" onClick={runUnstake} disabled={busy || !scan.positions.length}>
+              从农场解押全部
+            </button>
+            <button type="button" className="primary" onClick={runRemove} disabled={busy}>
+              撤池并把 TOKEN+WBNB 转给接收地址
+            </button>
+            <button type="button" className="danger" onClick={runTransferLp} disabled={busy}>
+              仅转 LP 凭证（不撤池）
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="panel">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <strong>日志</strong>
+          <button type="button" onClick={clear} disabled={busy}>
+            清空
+          </button>
+        </div>
+        <div className="log">
+          {lines.map((l, i) => (
+            <div key={i} className={l.type === "err" ? "err" : l.type === "ok" ? "ok" : ""}>
+              [{l.t}] {l.msg}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
