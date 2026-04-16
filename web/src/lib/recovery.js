@@ -32,11 +32,50 @@ const PAIR_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
   "function transfer(address to, uint256 amount) returns (bool)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
 ];
 
 const ROUTER_ABI = [
   "function removeLiquiditySupportingFeeOnTransferTokens(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB)",
+  "function removeLiquidity(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB)",
 ];
+
+const ERR_IFACE = new ethers.Interface([
+  "error Error(string message)",
+  "error Panic(uint256 code)",
+]);
+
+/** 尽量把 RPC 返回的 revert 转成可读说明（很多节点会省略 data，只能看到泛化错误） */
+export function formatSendError(err) {
+  if (err == null) return "unknown";
+  const chunks = [];
+  const base = err.shortMessage || err.message || String(err);
+  chunks.push(base);
+
+  const data =
+    err.data ??
+    err.error?.data ??
+    err.info?.error?.data ??
+    err.info?.error?.body;
+
+  if (typeof data === "string" && data.startsWith("0x") && data.length > 10) {
+    try {
+      const parsed = ERR_IFACE.parseError(data);
+      if (parsed?.name === "Error") {
+        chunks.push(`合约: ${parsed.args.message}`);
+      } else if (parsed?.name === "Panic") {
+        chunks.push(`Panic 码: ${parsed.args.code?.toString?.() ?? parsed.args.code}`);
+      }
+    } catch {
+      chunks.push(`revertData(前20字节): ${data.slice(0, 22)}…`);
+    }
+  }
+
+  if (err.revert?.signature) {
+    chunks.push(`revert: ${err.revert.signature}`);
+  }
+  return chunks.join(" | ");
+}
 
 const MC_V1_ABI = [
   "function poolLength() view returns (uint256)",
@@ -271,10 +310,15 @@ export async function unstakeAll(signer, positions, log) {
       log(`  交易: ${tx.hash}`);
       await tx.wait();
     } catch (e) {
-      log(`  withdraw 失败，尝试 emergency: ${e.shortMessage || e.message}`);
-      const tx2 = await c.emergencyWithdraw(p.pid);
-      log(`  交易: ${tx2.hash}`);
-      await tx2.wait();
+      log(`  withdraw 失败: ${formatSendError(e)}`);
+      try {
+        const tx2 = await c.emergencyWithdraw(p.pid);
+        log(`  emergencyWithdraw 交易: ${tx2.hash}`);
+        await tx2.wait();
+      } catch (e2) {
+        log(`  emergencyWithdraw 也失败: ${formatSendError(e2)}`);
+        throw e2;
+      }
     }
   }
 }
@@ -285,9 +329,14 @@ export async function getLpBalance(pair, user) {
 
 export async function transferLp(signer, pairAddr, recipient, amount, log) {
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, signer);
-  const tx = await pair.transfer(recipient, amount);
-  log(`转 LP tx: ${tx.hash}`);
-  await tx.wait();
+  try {
+    const tx = await pair.transfer(recipient, amount);
+    log(`转 LP tx: ${tx.hash}`);
+    await tx.wait();
+  } catch (e) {
+    log(`转 LP 失败: ${formatSendError(e)}`);
+    throw e;
+  }
 }
 
 export async function removeLiquidityToRecipient(
@@ -298,26 +347,59 @@ export async function removeLiquidityToRecipient(
 ) {
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, signer);
   const router = new ethers.Contract(PCS_ROUTER, ROUTER_ABI, signer);
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + 60 * 20);
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 60 * 120);
+
+  try {
+    const pairView = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+    const [r0, r1] = await pairView.getReserves();
+    log(`池子储备 reserve0=${r0.toString()} reserve1=${r1.toString()}（若为 0 则无法撤池）`);
+  } catch {
+    log("无法读取 getReserves（非标准 Pair 可忽略）");
+  }
 
   const allowance = await pair.allowance(userAddress, PCS_ROUTER);
   if (allowance < lpAmount) {
-    const txA = await pair.approve(PCS_ROUTER, ethers.MaxUint256);
-    log(`授权 Router: ${txA.hash}`);
-    await txA.wait();
+    try {
+      const txA = await pair.approve(PCS_ROUTER, ethers.MaxUint256);
+      log(`授权 Router(无限额): ${txA.hash}`);
+      await txA.wait();
+    } catch (e) {
+      log(`无限额授权失败: ${formatSendError(e)}，改为按数量授权…`);
+      const txA = await pair.approve(PCS_ROUTER, lpAmount);
+      log(`授权 Router: ${txA.hash}`);
+      await txA.wait();
+    }
   }
 
-  const txR = await router.removeLiquiditySupportingFeeOnTransferTokens(
-    t0,
-    t1,
-    lpAmount,
-    0n,
-    0n,
-    recipient,
-    deadline,
-  );
-  log(`撤池: ${txR.hash}`);
-  await txR.wait();
+  let txR;
+  try {
+    txR = await router.removeLiquiditySupportingFeeOnTransferTokens(
+      t0,
+      t1,
+      lpAmount,
+      0n,
+      0n,
+      recipient,
+      deadline,
+    );
+    log(`撤池(费改币路径): ${txR.hash}`);
+    await txR.wait();
+  } catch (e) {
+    log(`撤池(费改币路径)失败: ${formatSendError(e)}`);
+    log("尝试标准 removeLiquidity（适合无买卖税的币）…");
+    try {
+      txR = await router.removeLiquidity(t0, t1, lpAmount, 0n, 0n, recipient, deadline);
+      log(`撤池(标准路径): ${txR.hash}`);
+      await txR.wait();
+    } catch (e2) {
+      log(`撤池(标准路径)也失败: ${formatSendError(e2)}`);
+      log(
+        "常见原因：① LP 仍在农场未解押；② 池子储备为 0；③ 代币黑名单/暂停转账；④ 必须用其它 DEX 的 Router。请到 BscScan 核对 Pair 与代币合约。",
+        "err",
+      );
+      throw e2;
+    }
+  }
 
   const ercT = new ethers.Contract(token, ERC20_ABI, provider);
   const ercW = new ethers.Contract(wbnb, ERC20_ABI, provider);

@@ -54,11 +54,39 @@ const PAIR_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
   "function transfer(address to, uint256 amount) returns (bool)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
 ];
 
 const ROUTER_ABI = [
   "function removeLiquiditySupportingFeeOnTransferTokens(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB)",
+  "function removeLiquidity(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB)",
 ];
+
+const ERR_IFACE = new ethers.Interface([
+  "error Error(string message)",
+  "error Panic(uint256 code)",
+]);
+
+function formatSendError(err) {
+  if (err == null) return "unknown";
+  const chunks = [err.shortMessage || err.message || String(err)];
+  const data =
+    err.data ??
+    err.error?.data ??
+    err.info?.error?.data ??
+    err.info?.error?.body;
+  if (typeof data === "string" && data.startsWith("0x") && data.length > 10) {
+    try {
+      const parsed = ERR_IFACE.parseError(data);
+      if (parsed?.name === "Error") chunks.push(`合约: ${parsed.args.message}`);
+      else if (parsed?.name === "Panic")
+        chunks.push(`Panic: ${parsed.args.code?.toString?.() ?? parsed.args.code}`);
+    } catch {
+      chunks.push(`revertData: ${data.slice(0, 22)}…`);
+    }
+  }
+  return chunks.join(" | ");
+}
 
 const MC_V1_ABI = [
   "function poolLength() view returns (uint256)",
@@ -172,10 +200,15 @@ async function main() {
         console.log("  withdraw tx:", tx.hash);
         await tx.wait();
       } catch (e) {
-        console.warn("  withdraw 失败，尝试 emergencyWithdraw:", e.shortMessage || e.message);
-        const tx2 = await mcV2.emergencyWithdraw(pid);
-        console.log("  emergencyWithdraw tx:", tx2.hash);
-        await tx2.wait();
+        console.warn("  withdraw 失败:", formatSendError(e));
+        try {
+          const tx2 = await mcV2.emergencyWithdraw(pid);
+          console.log("  emergencyWithdraw tx:", tx2.hash);
+          await tx2.wait();
+        } catch (e2) {
+          console.error("  emergencyWithdraw 也失败:", formatSendError(e2));
+          throw e2;
+        }
       }
     }
     return found.length;
@@ -206,10 +239,15 @@ async function main() {
         console.log("  withdraw tx:", tx.hash);
         await tx.wait();
       } catch (e) {
-        console.warn("  withdraw 失败，尝试 emergencyWithdraw:", e.shortMessage || e.message);
-        const tx2 = await mcV1.emergencyWithdraw(pid);
-        console.log("  emergencyWithdraw tx:", tx2.hash);
-        await tx2.wait();
+        console.warn("  withdraw 失败:", formatSendError(e));
+        try {
+          const tx2 = await mcV1.emergencyWithdraw(pid);
+          console.log("  emergencyWithdraw tx:", tx2.hash);
+          await tx2.wait();
+        } catch (e2) {
+          console.error("  emergencyWithdraw 也失败:", formatSendError(e2));
+          throw e2;
+        }
       }
     }
     return found.length;
@@ -243,25 +281,48 @@ async function main() {
   }
 
   const router = new ethers.Contract(PCS_ROUTER, ROUTER_ABI, wallet);
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + 60 * 20);
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 60 * 120);
 
-  if ((await pair.allowance(me, PCS_ROUTER)) < lpBal) {
-    const txA = await pair.approve(PCS_ROUTER, ethers.MaxUint256);
-    console.log("approve Router tx:", txA.hash);
-    await txA.wait();
+  try {
+    const [r0, r1] = await pair.getReserves();
+    console.log("池子储备 reserve0=", r0.toString(), "reserve1=", r1.toString());
+  } catch {
+    console.log("无法读取 getReserves");
   }
 
-  const txR = await router.removeLiquiditySupportingFeeOnTransferTokens(
-    t0,
-    t1,
-    lpBal,
-    0n,
-    0n,
-    recipient,
-    deadline,
-  );
-  console.log("removeLiquidity tx:", txR.hash);
-  await txR.wait();
+  if ((await pair.allowance(me, PCS_ROUTER)) < lpBal) {
+    try {
+      const txA = await pair.approve(PCS_ROUTER, ethers.MaxUint256);
+      console.log("approve Router(无限额) tx:", txA.hash);
+      await txA.wait();
+    } catch (e) {
+      console.warn("无限额授权失败:", formatSendError(e), "改为精确授权");
+      const txA = await pair.approve(PCS_ROUTER, lpBal);
+      console.log("approve Router tx:", txA.hash);
+      await txA.wait();
+    }
+  }
+
+  let txR;
+  try {
+    txR = await router.removeLiquiditySupportingFeeOnTransferTokens(
+      t0,
+      t1,
+      lpBal,
+      0n,
+      0n,
+      recipient,
+      deadline,
+    );
+    console.log("removeLiquidity(费改) tx:", txR.hash);
+    await txR.wait();
+  } catch (e) {
+    console.warn("费改路径撤池失败:", formatSendError(e));
+    console.log("尝试标准 removeLiquidity…");
+    txR = await router.removeLiquidity(t0, t1, lpBal, 0n, 0n, recipient, deadline);
+    console.log("removeLiquidity(标准) tx:", txR.hash);
+    await txR.wait();
+  }
 
   const ercT = new ethers.Contract(token, ERC20_ABI, provider);
   const ercW = new ethers.Contract(wbnb, ERC20_ABI, provider);
