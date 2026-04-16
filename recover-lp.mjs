@@ -13,6 +13,7 @@
  *   TOKEN              可选，默认屎壳郎合约
  *   WBNB               可选，默认主网 WBNB
  *   PCS_FACTORY        可选，默认 Pancake V2 Factory
+ *   LP_PAIR            可选，若设置则直接按该 LP 合约地址扫描（忽略 TOKEN/WBNB/PCS_FACTORY）
  *   REMOVE_LIQUIDITY   可选，true=撤池后把两种 token 转给 RECIPIENT；false=只转 LP 凭证
  *   DRY_RUN            可选，true=只查询不写链
  *
@@ -93,11 +94,7 @@ async function main() {
   const recipient = ethers.getAddress(
     process.env.RECIPIENT || DEFAULT_RECIPIENT,
   );
-  const token = ethers.getAddress(process.env.TOKEN || DEFAULT_TOKEN);
-  const wbnb = ethers.getAddress(process.env.WBNB || DEFAULT_WBNB);
-  const factoryAddr = ethers.getAddress(
-    process.env.PCS_FACTORY || PCS_V2_FACTORY,
-  );
+  const lpPairEnv = process.env.LP_PAIR?.trim();
   const removeLiquidity = envBool("REMOVE_LIQUIDITY", true);
   const dryRun = envBool("DRY_RUN", false);
 
@@ -105,25 +102,46 @@ async function main() {
   const wallet = new ethers.Wallet(pk.startsWith("0x") ? pk : `0x${pk}`, provider);
   const me = wallet.address;
 
+  let token;
+  let wbnb;
+  let pairAddr;
+  let pair;
+
+  if (lpPairEnv) {
+    pairAddr = ethers.getAddress(lpPairEnv);
+    pair = new ethers.Contract(pairAddr, PAIR_ABI, wallet);
+    console.log("模式: 直接 LP 合约 LP_PAIR=", pairAddr);
+  } else {
+    token = ethers.getAddress(process.env.TOKEN || DEFAULT_TOKEN);
+    wbnb = ethers.getAddress(process.env.WBNB || DEFAULT_WBNB);
+    const factoryAddr = ethers.getAddress(
+      process.env.PCS_FACTORY || PCS_V2_FACTORY,
+    );
+    const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
+    pairAddr = await factory.getPair(token, wbnb);
+    if (pairAddr === ethers.ZeroAddress) {
+      console.error(
+        "在指定 Factory 上未找到该币对。若流动性在分叉 DEX，请设置 PCS_FACTORY 为对应 Factory 地址，或设置 LP_PAIR 为池子合约地址。",
+      );
+      process.exit(1);
+    }
+    pair = new ethers.Contract(pairAddr, PAIR_ABI, wallet);
+    console.log("模式: Factory + TOKEN/WBNB");
+  }
+
+  const t0 = await pair.token0();
+  const t1 = await pair.token1();
+  token = token ?? t0;
+  wbnb = wbnb ?? t1;
+
   console.log("钱包:", me);
   console.log("接收地址:", recipient);
-  console.log("TOKEN:", token);
-  console.log("WBNB:", wbnb);
+  console.log("TOKEN(用于扫尾转账):", token);
+  console.log("WBNB(用于扫尾转账):", wbnb);
   console.log("撤池后转 token:", removeLiquidity);
   console.log("DRY_RUN:", dryRun);
   console.log("---");
 
-  const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
-  const pairAddr = await factory.getPair(token, wbnb);
-  if (pairAddr === ethers.ZeroAddress) {
-    console.error(
-      "在指定 Factory 上未找到该币对。若流动性在分叉 DEX，请设置 PCS_FACTORY 为对应 Factory 地址。",
-    );
-    process.exit(1);
-  }
-  const pair = new ethers.Contract(pairAddr, PAIR_ABI, wallet);
-  const t0 = await pair.token0();
-  const t1 = await pair.token1();
   console.log("LP Pair:", pairAddr);
   console.log("token0:", t0, "token1:", t1);
 

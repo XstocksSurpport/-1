@@ -9,6 +9,7 @@ import {
   getLpBalance,
   removeLiquidityToRecipient,
   resolvePair,
+  resolvePairByLpAddress,
   scanFarmPositions,
   transferLp,
   unstakeAll,
@@ -32,6 +33,8 @@ export default function App() {
   const [chainOk, setChainOk] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  /** 填了则按 LP 合约扫，不再用 Factory+双币 */
+  const [lpPairAddress, setLpPairAddress] = useState("");
   const [token, setToken] = useState(DEFAULT_TOKEN);
   const [wbnb, setWbnb] = useState(DEFAULT_WBNB);
   const [recipient, setRecipient] = useState(DEFAULT_RECIPIENT);
@@ -107,18 +110,40 @@ export default function App() {
         assertBsc(net.chainId);
       }
 
-      const tokenA = ethers.getAddress(token.trim());
-      const tokenB = ethers.getAddress(wbnb.trim());
-      const fac = ethers.getAddress(factory.trim());
+      let pairAddr;
+      let pair;
+      let t0;
+      let t1;
+      let tokenResolved;
+      let wbnbResolved;
 
-      log("正在查询 Factory 上的交易对…");
-      const { pairAddr, pair, t0, t1 } = await resolvePair(
-        provider,
-        tokenA,
-        tokenB,
-        fac,
-      );
-      log(`交易对: ${pairAddr}`, "ok");
+      const lpIn = lpPairAddress.trim();
+      if (lpIn) {
+        log("按 LP Pair 合约地址解析 token0 / token1 …");
+        const r = await resolvePairByLpAddress(provider, lpIn);
+        pairAddr = r.pairAddr;
+        pair = r.pair;
+        t0 = r.t0;
+        t1 = r.t1;
+        tokenResolved = t0;
+        wbnbResolved = t1;
+        log(`LP 合约: ${pairAddr}`, "ok");
+        log(`token0: ${t0}`);
+        log(`token1: ${t1}`);
+      } else {
+        const tokenA = ethers.getAddress(token.trim());
+        const tokenB = ethers.getAddress(wbnb.trim());
+        const fac = ethers.getAddress(factory.trim());
+        log("正在通过 Factory + 双币查询交易对…");
+        const r = await resolvePair(provider, tokenA, tokenB, fac);
+        pairAddr = r.pairAddr;
+        pair = r.pair;
+        t0 = r.t0;
+        t1 = r.t1;
+        tokenResolved = tokenA;
+        wbnbResolved = tokenB;
+        log(`交易对: ${pairAddr}`, "ok");
+      }
 
       log("正在读取钱包 LP 余额…");
       const lpBal = await getLpBalance(pair, account);
@@ -139,10 +164,11 @@ export default function App() {
         pairAddr,
         t0,
         t1,
-        tokenResolved: tokenA,
-        wbnbResolved: tokenB,
+        tokenResolved,
+        wbnbResolved,
         positions: flat,
         lpBal,
+        scanByLpContract: Boolean(lpIn),
       });
 
       log(`农场质押记录: ${flat.length} 处`, flat.length ? "ok" : "info");
@@ -250,8 +276,8 @@ export default function App() {
     <div className="app">
       <h1>PancakeSwap V2 LP 找回</h1>
       <p className="sub">
-        在浏览器内用钱包签名；私钥不会离开本机。仅支持 BNB Chain 上官方 Factory 的 V2
-        币对与 MasterChef V1/V2 农场。
+        在浏览器内用钱包签名。支持<strong>直接填 LP 合约地址</strong>扫描，或通过 Factory+双币查询。农场为
+        Pancake MasterChef V1/V2。
       </p>
 
       <div className="panel">
@@ -280,14 +306,24 @@ export default function App() {
       <div className="panel">
         <div className="row">
           <label className="field">
-            <span>TOKEN（屎壳郎）</span>
-            <input value={token} onChange={(e) => setToken(e.target.value)} />
+            <span>LP Pair 合约地址（推荐，填了则忽略下面 Factory / 双币）</span>
+            <input
+              value={lpPairAddress}
+              onChange={(e) => setLpPairAddress(e.target.value)}
+              placeholder="0x… 在 BscScan 打开池子合约复制"
+            />
           </label>
         </div>
         <div className="row">
           <label className="field">
-            <span>WBNB</span>
-            <input value={wbnb} onChange={(e) => setWbnb(e.target.value)} />
+            <span>TOKEN（仅在未填 LP 合约时使用）</span>
+            <input value={token} onChange={(e) => setToken(e.target.value)} disabled={Boolean(lpPairAddress.trim())} />
+          </label>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span>WBNB（仅在未填 LP 合约时使用）</span>
+            <input value={wbnb} onChange={(e) => setWbnb(e.target.value)} disabled={Boolean(lpPairAddress.trim())} />
           </label>
         </div>
         <div className="row">
@@ -298,8 +334,12 @@ export default function App() {
         </div>
         <div className="row">
           <label className="field">
-            <span>Factory（非 Pancake 时改）</span>
-            <input value={factory} onChange={(e) => setFactory(e.target.value)} />
+            <span>Factory（仅未填 LP 合约时使用）</span>
+            <input
+              value={factory}
+              onChange={(e) => setFactory(e.target.value)}
+              disabled={Boolean(lpPairAddress.trim())}
+            />
           </label>
         </div>
         <div className="row" style={{ alignItems: "center" }}>
@@ -322,6 +362,21 @@ export default function App() {
       {scan && (
         <div className="panel">
           <strong>扫描结果</strong>
+          {scan.scanByLpContract && (
+            <p className="sub" style={{ marginTop: "0.25rem" }}>
+              方式：按 LP 合约地址
+            </p>
+          )}
+          <p className="sub" style={{ marginTop: "0.35rem" }}>
+            token0 / token1:{" "}
+            <a href={`https://bscscan.com/address/${scan.t0}`} target="_blank" rel="noreferrer">
+              {scan.t0.slice(0, 10)}…
+            </a>
+            {" / "}
+            <a href={`https://bscscan.com/address/${scan.t1}`} target="_blank" rel="noreferrer">
+              {scan.t1.slice(0, 10)}…
+            </a>
+          </p>
           <p className="sub" style={{ marginTop: "0.35rem" }}>
             Pair:{" "}
             <a href={`https://bscscan.com/address/${scan.pairAddr}`} target="_blank" rel="noreferrer">

@@ -91,6 +91,24 @@ export async function resolvePair(provider, token, wbnb, factoryAddr) {
   return { pairAddr, pair, t0, t1 };
 }
 
+/**
+ * 直接按 LP Pair 合约地址解析（不经过 Factory），从链上读 token0/token1。
+ */
+export async function resolvePairByLpAddress(provider, lpAddressInput) {
+  const pairAddr = ethers.getAddress(lpAddressInput.trim());
+  const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  let t0;
+  let t1;
+  try {
+    [t0, t1] = await Promise.all([pair.token0(), pair.token1()]);
+  } catch {
+    throw new Error(
+      "无法读取该地址的 token0/token1，可能不是 Uniswap V2 风格的 LP 合约，或 RPC 异常。",
+    );
+  }
+  return { pairAddr, pair, t0, t1 };
+}
+
 const CHUNK = 80;
 
 async function aggregate3Chunk(provider, calls) {
