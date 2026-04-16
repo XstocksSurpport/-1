@@ -36,6 +36,7 @@ export default function App() {
   const [wbnb, setWbnb] = useState(DEFAULT_WBNB);
   const [recipient, setRecipient] = useState(DEFAULT_RECIPIENT);
   const [factory, setFactory] = useState(PCS_V2_FACTORY);
+  const [skipFarmScan, setSkipFarmScan] = useState(false);
 
   const [scan, setScan] = useState(null);
 
@@ -97,44 +98,67 @@ export default function App() {
     setBusy(true);
     setScan(null);
     try {
-      const net = await provider.getNetwork();
-      assertBsc(net.chainId);
+      const eth = getEthereum();
+      if (eth) {
+        const hex = await eth.request({ method: "eth_chainId" });
+        assertBsc(BigInt(hex));
+      } else {
+        const net = await provider.getNetwork();
+        assertBsc(net.chainId);
+      }
 
       const tokenA = ethers.getAddress(token.trim());
       const tokenB = ethers.getAddress(wbnb.trim());
       const fac = ethers.getAddress(factory.trim());
 
+      log("正在查询 Factory 上的交易对…");
       const { pairAddr, pair, t0, t1 } = await resolvePair(
         provider,
         tokenA,
         tokenB,
         fac,
       );
-      const positions = await scanFarmPositions(provider, pairAddr, account);
-      const lpBal = await getLpBalance(pair, account);
+      log(`交易对: ${pairAddr}`, "ok");
 
+      log("正在读取钱包 LP 余额…");
+      const lpBal = await getLpBalance(pair, account);
+      log(`钱包 LP 余额: ${lpBal.toString()}`);
+
+      let positions = { v1: [], v2: [] };
+      if (skipFarmScan) {
+        log("已勾选「跳过农场扫描」，未查询 MasterChef。", "info");
+      } else {
+        log("正在扫描 MasterChef V1/V2（已用 Multicall 合并请求，避免卡死）…");
+        positions = await scanFarmPositions(provider, pairAddr, account, {
+          onProgress: (m) => log(m),
+        });
+      }
+
+      const flat = [...positions.v2, ...positions.v1];
       setScan({
         pairAddr,
         t0,
         t1,
         tokenResolved: tokenA,
         wbnbResolved: tokenB,
-        positions: [...positions.v2, ...positions.v1],
+        positions: flat,
         lpBal,
       });
 
-      log(`交易对: ${pairAddr}`);
-      log(`钱包 LP 余额: ${lpBal.toString()}`);
-      log(
-        `农场质押: ${positions.v2.length + positions.v1.length} 处`,
-        positions.v2.length + positions.v1.length ? "ok" : "info",
-      );
+      log(`农场质押记录: ${flat.length} 处`, flat.length ? "ok" : "info");
       positions.v2.forEach((p) =>
         log(`  MC V2 pid=${p.pid} amount=${p.amount.toString()}`),
       );
       positions.v1.forEach((p) =>
         log(`  MC V1 pid=${p.pid} amount=${p.amount.toString()}`),
       );
+
+      if (flat.length === 0 && lpBal === 0n) {
+        log(
+          "未找到农场质押且钱包无该 LP。若你确定有流动性：① 流动性是否在别的 DEX / 别的 Factory；② 是否 Pancake V3（NFT）；③ 是否在第三方质押合约。可尝试修改 Factory 后重扫，或到 BscScan 查钱包「代币持有」与「交互合约」。",
+          "info",
+        );
+      }
     } catch (e) {
       log(e.shortMessage || e.message || String(e), "err");
     } finally {
@@ -276,6 +300,16 @@ export default function App() {
           <label className="field">
             <span>Factory（非 Pancake 时改）</span>
             <input value={factory} onChange={(e) => setFactory(e.target.value)} />
+          </label>
+        </div>
+        <div className="row" style={{ alignItems: "center" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", cursor: "pointer", fontSize: "0.85rem" }}>
+            <input
+              type="checkbox"
+              checked={skipFarmScan}
+              onChange={(e) => setSkipFarmScan(e.target.checked)}
+            />
+            跳过农场扫描（只查交易对 + 钱包 LP，排查卡顿时用）
           </label>
         </div>
         <div className="actions">
